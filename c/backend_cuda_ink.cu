@@ -1,9 +1,13 @@
 /* CUDA backend for inkling.c — see backend_cuda_ink.h for scope.
  * One warp per output row, both operands rounded to bf16, f32 accumulate:
  * the same numeric contract as the CPU vdpbf16ps path (matmul_h), so GPU
- * and CPU runs stay closely comparable. */
-#include <cuda_runtime.h>
-#include <cuda_bf16.h>
+ * and CPU runs stay closely comparable.
+ *
+ * HIP (ROCm) builds through backend_gpu_compat.h like the main backend:
+ * same 14-symbol runtime surface plus the bf16 storage types, which the
+ * shim maps. Compiled by nvcc the shim is a pass-through (plus
+ * cuda_bf16.h), so the CUDA build is unchanged. */
+#include "backend_gpu_compat.h"
 #include <stdio.h>
 #include "backend_cuda_ink.h"
 

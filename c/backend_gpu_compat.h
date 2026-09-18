@@ -24,6 +24,13 @@
 #if defined(__HIP_PLATFORM_AMD__) || defined(__HIP__)
 #include <hip/hip_runtime.h>
 #include <hip/hip_fp16.h>
+/* bf16 storage types for backends shared with the inkling engine: HIP names
+ * the types __hip_bfloat16/__hip_bfloat162 while the conversion functions
+ * already match CUDA's (__bfloat162float/__float2bfloat16), so only the two
+ * type names need mapping. */
+#include <hip/hip_bf16.h>
+#define __nv_bfloat16  __hip_bfloat16
+#define __nv_bfloat162 __hip_bfloat162
 /* rocWMMA requires matrix cores (MFMA: gfx908+, WMMA: gfx11xx); on other
  * targets (gfx906, gfx101x, gfx103x) its headers static_assert. The Makefile
  * passes -DCOLI_HIP_NO_WMMA for those archs: the WMMA kernel bodies stay
@@ -85,6 +92,8 @@ namespace nvcuda { namespace wmma = ::rocwmma; }
 #define cudaEventElapsedTime     hipEventElapsedTime
 #define cudaMallocHost           hipHostMalloc
 #define cudaFreeHost             hipHostFree
+#define cudaSetDeviceFlags       hipSetDeviceFlags
+#define cudaDeviceScheduleSpin   hipDeviceScheduleSpin
 #define cudaMemcpyDeviceToDevice hipMemcpyDeviceToDevice
 #define cudaMemcpyPeer           hipMemcpyPeer
 #define cudaMemcpyPeerAsync      hipMemcpyPeerAsync
@@ -99,6 +108,7 @@ namespace nvcuda { namespace wmma = ::rocwmma; }
 #define __trap                   abort
 #else
 #include <cuda_runtime.h>
+#include <cuda_bf16.h>
 #include <mma.h>
 #define COLI_GPU_HAS_WMMA        1
 #endif
