@@ -21,6 +21,7 @@ from openai_server import (APIError, APIHandler, APIServer, ClientCancelled,
                            _engine_error, _image_bytes_from_url, cap_for_arch, conversation_cache_slot, model_arch,
                            generation_options, parse_tool_calls, parse_dsv4_tool_calls,
                            parse_arch_tool_calls, parse_k3_tool_calls, parse_qwen38_tool_calls,
+                           _tool_stream_markers,
                            read_engine_turn, render_chat, render_chat_kimi, render_chat_olmoe,
                            render_chat_qwen, render_chat_qwen38, render_chat_v4, _dsv4_tool_calls, serve,
                            split_thinking_reply,
@@ -231,6 +232,52 @@ class TemplateTest(unittest.TestCase):
         prompt = render_chat_qwen([{"role": "user", "content": "Hi"}],
                                   tools=[tool], tool_choice="none")
         self.assertNotIn("<tools>", prompt)
+
+    def test_qwen38_bare_call_parses_without_wrapper(self):
+        # Live KAT-finetune quirk: well-formed inner block, no outer
+        # <tool_call>. Observed 3/3 forced prompts; the wrapped form stays
+        # preferred and is tried first.
+        tool = {"type": "function", "function": {
+            "name": "add", "description": "a",
+            "parameters": {"type": "object",
+                           "properties": {"a": {"type": "integer"},
+                                          "b": {"type": "integer"}}}}}
+        text, calls = parse_qwen38_tool_calls(
+            "<function=add>\n<parameter=a>\n37\n</parameter>\n"
+            "<parameter=b>\n48\n</parameter>\n</function>", [tool])
+        self.assertEqual(text, "")
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0]["function"]["name"], "add")
+        self.assertEqual(json.loads(calls[0]["function"]["arguments"]),
+                         {"a": 37, "b": 48})
+
+    def test_qwen38_wrapped_preferred_over_bare(self):
+        tool = {"type": "function", "function": {
+            "name": "f", "description": "d",
+            "parameters": {"type": "object",
+                           "properties": {"x": {"type": "string"}}}}}
+        reply = ("<tool_call>\n<function=f>\n<parameter=x>\n1\n</parameter>\n"
+                 "</function>\n</tool_call>\n"
+                 "<function=f>\n<parameter=x>\n2\n</parameter>\n</function>")
+        text, calls = parse_qwen38_tool_calls(reply, [tool])
+        self.assertEqual(
+            [json.loads(c["function"]["arguments"])["x"] for c in calls],
+            ["1", "2"])
+        self.assertEqual(text, "")
+
+    def test_qwen38_no_false_positive_on_plain_text(self):
+        text, calls = parse_qwen38_tool_calls(
+            "Use the add function for sums; it takes a and b.", None)
+        self.assertEqual(calls, [])
+        self.assertIn("add function", text)
+
+    def test_qwen36_stream_markers_hold_back_both_forms(self):
+        with patch("openai_server.ARCH", "qwen36"):
+            markers = _tool_stream_markers()
+        self.assertIn("<tool_call>", markers)
+        self.assertIn("<function=", markers)
+        with patch("openai_server.ARCH", "qwen38"):
+            self.assertNotIn("<function=", _tool_stream_markers())
 
     def test_qwen36_without_tools_keeps_legacy_rendering(self):
         # No tools: framing, think-block branches, and lenient roles are

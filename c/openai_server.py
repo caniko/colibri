@@ -586,6 +586,11 @@ def _tool_stream_markers():
         return (v41_dsml.TOOL_CALLS_PREFIX, v41_dsml.TOOL_CALL_PREFIX)
     if ARCH == "kimi":
         return (K3_TOOLS_OPEN,)
+    if ARCH == "qwen36":
+        # The KAT finetune emits bare <function=> blocks without the outer
+        # <tool_call> wrapper (observed live, 3/3 forced prompts): hold back
+        # both markers so neither form leaks into content deltas.
+        return (BOX_START, "<function=")
     return (BOX_START,)
 
 
@@ -1362,6 +1367,12 @@ def _qwen38_tool_calls(tool_calls, has_content, index):
 QWEN38_CALL_RE = re.compile(
     r"<tool_call>\s*<function=([^>\n]+)>\s*(.*?)</function>\s*</tool_call>", re.S)
 QWEN38_PARAM_RE = re.compile(r"<parameter=([^>\n]+)>\n(.*?)\n</parameter>", re.S)
+# Bare inner block without the outer <tool_call> wrapper. The KAT coder
+# finetune emits this form despite the template's <IMPORTANT> nesting
+# reminder (observed live); the wrapped form above stays preferred and is
+# always tried first.
+QWEN38_BARE_CALL_RE = re.compile(
+    r"<function=([^>\n]+)>\s*(.*?)</function>", re.S)
 
 
 def parse_qwen38_tool_calls(reply, tools=None):
@@ -1380,31 +1391,42 @@ def parse_qwen38_tool_calls(reply, tools=None):
             schema[fn.get("name")] = params
     calls = []
     for match in QWEN38_CALL_RE.finditer(reply or ""):
-        name = match.group(1).strip()
-        args = {}
-        for key, raw in QWEN38_PARAM_RE.findall(match.group(2)):
-            key = key.strip()
-            declared = (schema.get(name) or {}).get(key) or {}
-            kind = declared.get("type") if isinstance(declared, dict) else None
-            if kind in (None, "string"):
-                args[key] = raw
-            else:
-                try:
-                    args[key] = json.loads(raw)
-                except (TypeError, ValueError):
-                    args[key] = raw
-        calls.append({
-            "id": f"call_{uuid.uuid4().hex[:24]}",
-            "type": "function",
-            "function": {"name": name,
-                         "arguments": json.dumps(args, ensure_ascii=False)},
-        })
+        calls.append(_qwen38_call_from_match(match.group(1), match.group(2), schema))
     text = QWEN38_CALL_RE.sub("", reply or "")
-    if not calls and tools and "<tool_call>" in (reply or ""):
+    # Bare inner blocks (KAT-finetune quirk, see above): parse them from
+    # what remains after the wrapped matches are removed, so a wrapped
+    # call's inner block is never double-counted as bare.
+    for match in QWEN38_BARE_CALL_RE.finditer(text):
+        calls.append(_qwen38_call_from_match(match.group(1), match.group(2), schema))
+    text = QWEN38_BARE_CALL_RE.sub("", text)
+    if not calls and tools and ("<tool_call>" in (reply or "") or "<function=" in (reply or "")):
         sys.stderr.write("[api] qwen38 tool markers present but no call parsed -- "
                          "possibly truncated or mangled output\n")
         sys.stderr.flush()
     return text.strip(), calls
+
+
+def _qwen38_call_from_match(name, body, schema):
+    """Build one OpenAI tool_calls entry from a regex match (wrapped or bare)."""
+    name = name.strip()
+    args = {}
+    for key, raw in QWEN38_PARAM_RE.findall(body):
+        key = key.strip()
+        declared = (schema.get(name) or {}).get(key) or {}
+        kind = declared.get("type") if isinstance(declared, dict) else None
+        if kind in (None, "string"):
+            args[key] = raw
+        else:
+            try:
+                args[key] = json.loads(raw)
+            except (TypeError, ValueError):
+                args[key] = raw
+    return {
+        "id": f"call_{uuid.uuid4().hex[:24]}",
+        "type": "function",
+        "function": {"name": name,
+                     "arguments": json.dumps(args, ensure_ascii=False)},
+    }
 
 
 def render_chat_qwen38(messages, enable_thinking=True, reasoning_effort=None, tools=None,
