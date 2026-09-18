@@ -22,7 +22,7 @@ from openai_server import (APIError, APIHandler, APIServer, ClientCancelled,
                            generation_options, parse_tool_calls, parse_dsv4_tool_calls,
                            parse_arch_tool_calls, parse_k3_tool_calls, parse_qwen38_tool_calls,
                            read_engine_turn, render_chat, render_chat_kimi, render_chat_olmoe,
-                           render_chat_qwen38, render_chat_v4, _dsv4_tool_calls, serve,
+                           render_chat_qwen, render_chat_qwen38, render_chat_v4, _dsv4_tool_calls, serve,
                            split_thinking_reply,
                            stop_policy, tune_child_env)
 
@@ -173,6 +173,78 @@ class TemplateTest(unittest.TestCase):
         prompt = render_chat_qwen38([{"role": "user", "content": "Hi"}],
                                     tools=[tool], tool_choice="none")
         self.assertNotIn("<tools>", prompt)
+
+    def test_qwen36_renders_tools_and_round_trips_a_call(self):
+        tool = {"type": "function", "function": {
+            "name": "weather", "description": "w",
+            "parameters": {"type": "object",
+                           "properties": {"city": {"type": "string"},
+                                          "days": {"type": "integer"}}}}}
+        prompt = render_chat_qwen([{"role": "user", "content": "Rome?"}], tools=[tool])
+        # Qwen3.6 opens ONE leading system turn with the tool block (template
+        # lines 45-60), transcribed verbatim -- never a paraphrase the model
+        # has not seen.
+        self.assertIn("<|im_start|>system\n# Tools\n\nYou have access to the "
+                      "following functions:\n\n<tools>", prompt)
+        self.assertIn("<function=example_function_name>", prompt)
+        self.assertIn("</tools>", prompt)
+
+        # The user's own system text joins the same turn, never a second one.
+        with_system = render_chat_qwen([
+            {"role": "system", "content": "Be brief."},
+            {"role": "user", "content": "Rome?"}], tools=[tool])
+        self.assertEqual(with_system.count("<|im_start|>system"), 1)
+        self.assertIn("Be brief.", with_system)
+
+        # History: assistant tool_calls attach like the template (blank line
+        # iff content), consecutive tool results share one user turn.
+        history = render_chat_qwen([
+            {"role": "user", "content": "Rome?"},
+            {"role": "assistant", "content": "Checking.", "tool_calls": [
+                {"type": "function", "function": {
+                    "name": "weather", "arguments": {"city": "Rome"}}}]},
+            {"role": "tool", "content": "clear"},
+            {"role": "tool", "content": "dry"},
+            {"role": "user", "content": "thanks"},
+        ], tools=[tool])
+        self.assertIn("Checking.\n\n<tool_call>\n<function=weather>\n"
+                      "<parameter=city>\nRome\n</parameter>\n</function>\n</tool_call>",
+                      history)
+        self.assertIn("<|im_start|>user\n<tool_response>\nclear\n</tool_response>"
+                      "\n<tool_response>\ndry\n</tool_response><|im_end|>", history)
+
+        # The qwen36 arch parses the same syntax back (streaming suppresses
+        # the raw block via the shared <tool_call> marker).
+        with patch("openai_server.ARCH", "qwen36"):
+            text, calls = parse_arch_tool_calls(
+                "Sure.\n\n<tool_call>\n<function=weather>\n<parameter=city>\nRome\n"
+                "</parameter>\n<parameter=days>\n3\n</parameter>\n</function>\n</tool_call>",
+                [tool])
+        self.assertEqual(text, "Sure.")
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0]["function"]["name"], "weather")
+        self.assertEqual(json.loads(calls[0]["function"]["arguments"]),
+                         {"city": "Rome", "days": 3})
+
+    def test_qwen36_tool_choice_none_suppresses_the_declaration(self):
+        tool = {"type": "function", "function": {"name": "f", "description": "d"}}
+        prompt = render_chat_qwen([{"role": "user", "content": "Hi"}],
+                                  tools=[tool], tool_choice="none")
+        self.assertNotIn("<tools>", prompt)
+
+    def test_qwen36_without_tools_keeps_legacy_rendering(self):
+        # No tools: framing, think-block branches, and lenient roles are
+        # unchanged from before the tool wiring.
+        self.assertEqual(
+            render_chat_qwen([{"role": "user", "content": "Hi"}]),
+            "<|im_start|>user\nHi<|im_end|>\n"
+            "<|im_start|>assistant\n<think>\n\n</think>\n\n")
+        thinking = render_chat_qwen([{"role": "user", "content": "Hi"}],
+                                    enable_thinking=True)
+        self.assertTrue(thinking.endswith("<|im_start|>assistant\n<think>\n"))
+        with self.assertRaises(APIError):
+            render_chat_qwen([{"role": "user", "content": "Hi"}],
+                             tools="weather")
 
     def test_kimi_payload_preserves_utf8_lengths_and_turns(self):
         prompt = render_chat_kimi([
@@ -2131,6 +2203,28 @@ class GlmReasoningStreamTest(unittest.TestCase):
         reasoning, content, _ = self._deltas(raw)
         self.assertEqual(reasoning, "")
         self.assertEqual(content, "Just the answer")
+
+    def test_qwen36_streaming_tool_call_parses_without_leaking_markers(self):
+        tool = {"type": "function", "function": {
+            "name": "weather", "description": "w",
+            "parameters": {"type": "object",
+                           "properties": {"city": {"type": "string"}}}}}
+        # Marker split across chunks: the hold-back must not leak raw syntax
+        # into content deltas, and the final message carries the parsed call.
+        base = self._server(["Sure. ", "<tool_ca", "ll>\n<function=weather>\n",
+                             "<parameter=city>\nRome\n</parameter>\n",
+                             "</function>\n</tool_call>"])
+        with patch("openai_server.ARCH", "qwen36"):
+            raw = self._post(base, {"model": "test-model", "stream": True,
+                                    "messages": [{"role": "user", "content": "Rome?"}],
+                                    "tools": [tool]})
+        _reasoning, content, tool_calls = self._deltas(raw)
+        self.assertEqual(content, "Sure. ")
+        self.assertNotIn("<tool_call>", raw)
+        self.assertNotIn("<function=", raw)
+        self.assertTrue(tool_calls, "expected a parsed tool call")
+        self.assertEqual(tool_calls[0]["function"]["name"], "weather")
+        self.assertIn("Rome", tool_calls[0]["function"]["arguments"])
 
     def test_streaming_reasoning_stays_out_of_tool_call(self):
         base = self._server(["deciding to call", "</think>",

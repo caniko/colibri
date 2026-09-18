@@ -568,6 +568,11 @@ def parse_arch_tool_calls(reply, tools, tool_reply=None):
         return parse_k3_tool_calls(reply, tools)  # compatibility with pre-#1147 engines
     if ARCH == "qwen38":
         return parse_qwen38_tool_calls(reply, tools)
+    if ARCH == "qwen36":
+        # Qwen3.6's template emits the same XML-ish call syntax as Qwen3.8
+        # (transcribed from chat_template.jinja, not paraphrased), so the
+        # qwen38 parser is the qwen36 parser.
+        return parse_qwen38_tool_calls(reply, tools)
     return parse_tool_calls(reply, tools)
 
 
@@ -1221,23 +1226,69 @@ def render_chat_qwen(messages, enable_thinking=False, reasoning_effort=None, too
     model was never trained on the bare `assistant\\n` state, and greedy
     argmax there lands on an EOS special (measured: gen=0). With thinking
     disabled the template pre-closes the block instead; both branches are
-    mirrored here byte for byte."""
+    mirrored here byte for byte.
+
+    Tool calling follows the same template: with tools it opens ONE leading
+    system turn (`# Tools` block, then the user's own system text when the
+    first message is one), calls render as
+    `<tool_call>\\n<function=NAME>...` and tool results share a single user
+    turn as `<tool_response>`. That XML-ish syntax is byte-identical to
+    Qwen3.8's, so the qwen38 block/call builders and parser are reused
+    directly rather than duplicated."""
     if not isinstance(messages, list) or not messages:
         raise APIError(400, "`messages` must be a non-empty array.", "messages")
-    if tools or tool_choice not in (None, "none"):
-        raise APIError(400, "Tool use is not wired up for the qwen36 engine yet.",
-                       "tools", "unsupported_parameter")
+    if tool_choice in ("none",):
+        tools = None                              # the client forbade them: do not offer any
+    if tools is not None and not isinstance(tools, list):
+        raise APIError(400, "`tools` must be an array.", "tools")
     parts = []
-    for index, message in enumerate(messages):
+    start = 0
+    if tools:
+        # The template builds one leading system turn: the tool block, then
+        # the user's own system text last -- never a second system turn.
+        first = messages[0]
+        first_role = first.get("role") if isinstance(first, dict) else None
+        if first_role == "developer":
+            first_role = "system"
+        block = _qwen38_tool_block(tools)
+        if first_role == "system":
+            raw = first.get("content")
+            system_text = content_text(raw, "messages.0.content").strip() if raw is not None else ""
+            if system_text:
+                block += "\n\n" + system_text
+            start = 1
+        parts.append(f"<|im_start|>system\n{block}<|im_end|>\n")
+    for index, message in enumerate(messages[start:], start=start):
         if not isinstance(message, dict):
             raise APIError(400, "Each message must be an object.", f"messages.{index}")
         role = message.get("role")
         if role == "developer":
             role = "system"
-        if role not in ("system", "user", "assistant"):
+        if role not in ("system", "user", "assistant", "tool"):
             raise APIError(400, f"Unsupported role {role!r}.", f"messages.{index}.role")
         raw = message.get("content")
         text = content_text(raw, f"messages.{index}.content") if raw is not None else ""
+        if role == "tool":
+            # Consecutive tool results share ONE user turn: the opening tag is
+            # written only when the previous message was not a tool, and the
+            # closing one only when the next is not. Emitting a turn per result
+            # would be a different conversation shape.
+            prev = messages[index - 1].get("role") if index > 0 and isinstance(
+                messages[index - 1], dict) else None
+            nxt = messages[index + 1].get("role") if index + 1 < len(messages) and isinstance(
+                messages[index + 1], dict) else None
+            if prev != "tool":
+                parts.append("<|im_start|>user")
+            parts.append(f"\n<tool_response>\n{text}\n</tool_response>")
+            if nxt != "tool":
+                parts.append("<|im_end|>\n")
+            continue
+        if role == "assistant":
+            calls = message.get("tool_calls")
+            if calls:
+                text = text + _qwen38_tool_calls(calls, bool(text.strip()), index)
+            parts.append(f"<|im_start|>assistant\n{text}<|im_end|>\n")
+            continue
         parts.append(f"<|im_start|>{role}\n{text}<|im_end|>\n")
     parts.append("<|im_start|>assistant\n")
     parts.append("<think>\n" if enable_thinking else "<think>\n\n</think>\n\n")
