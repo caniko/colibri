@@ -9,6 +9,7 @@
  * cuda_bf16.h), so the CUDA build is unchanged. */
 #include "backend_gpu_compat.h"
 #include <stdio.h>
+#include <string.h>
 #include "backend_cuda_ink.h"
 
 static cudaStream_t g_st;
@@ -65,7 +66,10 @@ __global__ void mm_bf16_kernel(const __nv_bfloat16 * __restrict__ W,
         float xb = __bfloat162float(__float2bfloat16(xs[i + 1]));
         acc += __bfloat162float(wv.x) * xa + __bfloat162float(wv.y) * xb;
     }
-    for (int off = 16; off; off >>= 1) acc += __shfl_down_sync(0xffffffffu, acc, off);
+    /* 64-bit mask: HIP requires a 64-bit lane mask while CUDA takes 32
+     * bits; the all-lanes value is identical either way, so one spelling
+     * serves both compilers. */
+    for (int off = 16; off; off >>= 1) acc += __shfl_down_sync(0xffffffffffffffffull, acc, off);
     if (!lane) y[(size_t)s * O + o] = acc;
 }
 
