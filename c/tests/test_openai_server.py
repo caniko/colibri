@@ -21,6 +21,7 @@ from openai_server import (APIError, APIHandler, APIServer, ClientCancelled,
                            _engine_error, _image_bytes_from_url, cap_for_arch, conversation_cache_slot, model_arch,
                            generation_options, parse_tool_calls, parse_dsv4_tool_calls,
                            parse_arch_tool_calls, parse_k3_tool_calls, parse_qwen38_tool_calls,
+                           parse_qwen36_tool_calls,
                            _tool_stream_markers,
                            read_engine_turn, render_chat, render_chat_kimi, render_chat_olmoe,
                            render_chat_qwen, render_chat_qwen38, render_chat_v4, _dsv4_tool_calls, serve,
@@ -233,10 +234,9 @@ class TemplateTest(unittest.TestCase):
                                   tools=[tool], tool_choice="none")
         self.assertNotIn("<tools>", prompt)
 
-    def test_qwen38_bare_call_parses_without_wrapper(self):
-        # Live KAT-finetune quirk: well-formed inner block, no outer
-        # <tool_call>. Observed 3/3 forced prompts; the wrapped form stays
-        # preferred and is tried first.
+    def test_qwen38_ignores_bare_blocks(self):
+        # The bare-block tolerance is a qwen36-only quirk (KAT finetune):
+        # Qwen3.8 keeps the strict wrapped syntax.
         tool = {"type": "function", "function": {
             "name": "add", "description": "a",
             "parameters": {"type": "object",
@@ -245,25 +245,108 @@ class TemplateTest(unittest.TestCase):
         text, calls = parse_qwen38_tool_calls(
             "<function=add>\n<parameter=a>\n37\n</parameter>\n"
             "<parameter=b>\n48\n</parameter>\n</function>", [tool])
+        self.assertEqual(calls, [])
+        self.assertIn("<function=add>", text)
+
+    def test_qwen36_bare_call_parses_without_wrapper(self):
+        # Live KAT-finetune quirk: well-formed inner block, no outer
+        # <tool_call>. Observed 3/3 forced prompts; the wrapped form stays
+        # preferred and is tried first.
+        tool = {"type": "function", "function": {
+            "name": "add", "description": "a",
+            "parameters": {"type": "object",
+                           "properties": {"a": {"type": "integer"},
+                                          "b": {"type": "integer"}}}}}
+        text, calls = parse_qwen36_tool_calls(
+            "<function=add>\n<parameter=a>\n37\n</parameter>\n"
+            "<parameter=b>\n48\n</parameter>\n</function>", [tool])
         self.assertEqual(text, "")
         self.assertEqual(len(calls), 1)
         self.assertEqual(calls[0]["function"]["name"], "add")
         self.assertEqual(json.loads(calls[0]["function"]["arguments"]),
                          {"a": 37, "b": 48})
 
-    def test_qwen38_wrapped_preferred_over_bare(self):
+    def test_qwen36_keeps_document_order_across_forms(self):
         tool = {"type": "function", "function": {
             "name": "f", "description": "d",
             "parameters": {"type": "object",
                            "properties": {"x": {"type": "string"}}}}}
-        reply = ("<tool_call>\n<function=f>\n<parameter=x>\n1\n</parameter>\n"
+        reply = ("<function=f>\n<parameter=x>\n0\n</parameter>\n</function>\n"
+                 "<tool_call>\n<function=f>\n<parameter=x>\n1\n</parameter>\n"
                  "</function>\n</tool_call>\n"
                  "<function=f>\n<parameter=x>\n2\n</parameter>\n</function>")
-        text, calls = parse_qwen38_tool_calls(reply, [tool])
+        text, calls = parse_qwen36_tool_calls(reply, [tool])
         self.assertEqual(
             [json.loads(c["function"]["arguments"])["x"] for c in calls],
-            ["1", "2"])
+            ["0", "1", "2"])
         self.assertEqual(text, "")
+
+    def test_qwen36_ignores_undeclared_names(self):
+        declared = {"type": "function", "function": {
+            "name": "f", "description": "d",
+            "parameters": {"type": "object",
+                           "properties": {"x": {"type": "string"}}}}}
+        text, calls = parse_qwen36_tool_calls(
+            "<function=ghost>\n<parameter=x>\n1\n</parameter>\n</function>",
+            [declared])
+        self.assertEqual(calls, [])
+        self.assertIn("<function=ghost>", text)
+
+    def test_qwen36_ignores_quoted_examples(self):
+        tool = {"type": "function", "function": {
+            "name": "f", "description": "d",
+            "parameters": {"type": "object",
+                           "properties": {"x": {"type": "string"}}}}}
+        text, calls = parse_qwen36_tool_calls(
+            "Reply like `<function=f>\n<parameter=x>\n1\n</parameter>\n</function>`.",
+            [tool])
+        self.assertEqual(calls, [])
+        self.assertIn("Reply like", text)
+
+    def test_qwen36_keeps_markdown_inside_arguments(self):
+        # Stripping quoted text before parsing would eat backticks inside
+        # parameter values. A coding-tool argument carrying inline code or
+        # a fenced block must round-trip intact.
+        tool = {"type": "function", "function": {
+            "name": "run", "description": "d",
+            "parameters": {"type": "object",
+                           "properties": {"code": {"type": "string"}}}}}
+        reply = ("<function=run>\n<parameter=code>\nuse `identifier` here\n"
+                 "</parameter>\n</function>")
+        text, calls = parse_qwen36_tool_calls(reply, [tool])
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(json.loads(calls[0]["function"]["arguments"]),
+                         {"code": "use `identifier` here"})
+        fenced = ("<function=run>\n<parameter=code>\n```python\nx = 1\n```\n"
+                  "</parameter>\n</function>")
+        text, calls = parse_qwen36_tool_calls(fenced, [tool])
+        self.assertEqual(len(calls), 1)
+        self.assertIn("```python", json.loads(calls[0]["function"]["arguments"])["code"])
+
+    def test_qwen36_removes_call_not_identical_quoted_example(self):
+        # Removing matches by string replace deletes the first identical
+        # string -- the quoted example -- instead of the actual call.
+        tool = {"type": "function", "function": {
+            "name": "f", "description": "d",
+            "parameters": {"type": "object",
+                           "properties": {"x": {"type": "string"}}}}}
+        call = "<function=f>\n<parameter=x>\n1\n</parameter>\n</function>"
+        reply = f"Example: `{call}`.\n\nNow: {call}"
+        text, calls = parse_qwen36_tool_calls(reply, [tool])
+        self.assertEqual(len(calls), 1)
+        self.assertIn("Example:", text)
+        self.assertIn(call, text)  # the quoted example stays
+        self.assertEqual(text.count("<function=f>"), 1)  # only the example
+
+    def test_qwen36_truncated_wrapper_parses_nothing(self):
+        tool = {"type": "function", "function": {
+            "name": "f", "description": "d",
+            "parameters": {"type": "object",
+                           "properties": {"x": {"type": "string"}}}}}
+        text, calls = parse_qwen36_tool_calls(
+            "<tool_call>\n<function=f>\n<parameter=x>\n1\n</parameter>\n",
+            [tool])
+        self.assertEqual(calls, [])
 
     def test_qwen38_no_false_positive_on_plain_text(self):
         text, calls = parse_qwen38_tool_calls(

@@ -115,6 +115,12 @@ void qt_note_block(int layer, int eid,
              const float *gs, const float *us, const float *ds);
 void qt_fill_wait(void);   /* blocks until every enqueued upload is resident (not merely dequeued) */
 
+/* Strict GPU residency (COLI_STRICT_RESIDENCY=1): placement accounting
+ * and miss predicate. The engine verifies full placement after warmstart
+ * and refuses hybrid serve or CPU-fallback requests; see qt_init. */
+int  qt_verify_full_placement(void);
+int  qt_strict_miss(uint32_t mask, int K);
+int  qt_strict_on(void);
 /* One telemetry block on stderr: residency, hits/misses, uploads per device. */
 void qt_stats(void);
 
@@ -131,6 +137,9 @@ static inline int  qt_dnproj_init(int a,const int8_t*b,const float*c,int d,int e
 static inline int  qt_dnproj_matmul(int a,float*b,const float*c,int d,int e){(void)a;(void)b;(void)c;(void)d;(void)e;return 0;}
 static inline int  qt_ready(void){return 0;}
 static inline int  qt_is_resident(int a,int b){(void)a;(void)b;return 0;}
+static inline int  qt_verify_full_placement(void){return -1;}
+static inline int  qt_strict_miss(uint32_t a,int b){(void)a;(void)b;return 0;}
+static inline int  qt_strict_on(void){return 0;}
 static inline void qt_shutdown(void){}
 static inline void qt_note(int a,int b,const uint8_t*c,const uint8_t*d,const uint8_t*e,const float*f,const float*g,const float*h){(void)a;(void)b;(void)c;(void)d;(void)e;(void)f;(void)g;(void)h;}
 static inline uint32_t qt_issue(int a,const int*b,int c,const float*d){(void)a;(void)b;(void)c;(void)d;return 0;}

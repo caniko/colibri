@@ -569,10 +569,9 @@ def parse_arch_tool_calls(reply, tools, tool_reply=None):
     if ARCH == "qwen38":
         return parse_qwen38_tool_calls(reply, tools)
     if ARCH == "qwen36":
-        # Qwen3.6's template emits the same XML-ish call syntax as Qwen3.8
-        # (transcribed from chat_template.jinja, not paraphrased), so the
-        # qwen38 parser is the qwen36 parser.
-        return parse_qwen38_tool_calls(reply, tools)
+        # Same wire syntax as Qwen3.8, plus the KAT-finetune bare-block
+        # quirk (never enabled for Qwen3.8 itself).
+        return parse_qwen36_tool_calls(reply, tools)
     return parse_tool_calls(reply, tools)
 
 
@@ -1383,26 +1382,83 @@ def parse_qwen38_tool_calls(reply, tools=None):
     the text alone. Where the declared schema says a parameter is not a string we
     re-read it as JSON, which restores numbers and booleans without guessing at
     anything the schema did not promise."""
+    return _parse_qwen_tool_calls(reply, tools, allow_bare=False)
+
+
+def parse_qwen36_tool_calls(reply, tools=None):
+    """Parse Qwen3.6's XML-ish calls, tolerating the KAT-finetune quirk.
+
+    Same wire syntax as Qwen3.8 (the template is transcribed, not
+    paraphrased), plus bare inner blocks: the KAT coder finetune emits
+    well-formed <function=> blocks without the outer <tool_call> wrapper
+    despite the template's nesting reminder (observed live). The wrapped
+    form stays preferred; bare matches inside wrapped spans are never
+    double-counted; calls keep document order. Quoted (backtick) examples
+    are not calls."""
+    return _parse_qwen_tool_calls(reply, tools, allow_bare=True)
+
+
+def _parse_qwen_tool_calls(reply, tools, allow_bare):
     schema = {}
     for tool in (tools or []):
         fn = tool.get("function", tool) if isinstance(tool, dict) else {}
         params = (fn.get("parameters") or {}).get("properties") or {}
         if isinstance(params, dict):
             schema[fn.get("name")] = params
+    # Quoted examples document the syntax; they never invoke anything. Span
+    # arithmetic on the ORIGINAL reply: stripping quoted text before parsing
+    # would also strip backticks inside parameter values (a coding tool arg
+    # containing `identifier` or a fenced block would lose content), and
+    # removing matches by string replace can delete an identical quoted
+    # example instead of the actual call.
+    original = reply or ""
+    quoted = [(m.start(), m.end()) for m in re.finditer(
+        r"```.*?```|`[^`]*`", original, flags=re.S)]
+
+    def in_quoted(start, end):
+        # The marker position decides: a call STARTING inside quoted text
+        # is a documented example. Backticks inside the arguments (inline
+        # code, fenced blocks) must not disqualify a call that starts
+        # outside quotes.
+        return any(qs <= start < qe for qs, qe in quoted)
+
+    found = []
+    for match in QWEN38_CALL_RE.finditer(original):
+        if in_quoted(match.start(), match.end()):
+            continue
+        found.append((match.start(), "wrapped", match))
+    if allow_bare:
+        wrapped_spans = [(m.start(), m.end()) for _, _, m in found]
+        for match in QWEN38_BARE_CALL_RE.finditer(original):
+            if in_quoted(match.start(), match.end()):
+                continue
+            if any(start <= match.start() and match.end() <= end
+                   for start, end in wrapped_spans):
+                continue  # inner block of a wrapped call: not a second call
+            found.append((match.start(), "bare", match))
+    found.sort(key=lambda item: item[0])
     calls = []
-    for match in QWEN38_CALL_RE.finditer(reply or ""):
-        calls.append(_qwen38_call_from_match(match.group(1), match.group(2), schema))
-    text = QWEN38_CALL_RE.sub("", reply or "")
-    # Bare inner blocks (KAT-finetune quirk, see above): parse them from
-    # what remains after the wrapped matches are removed, so a wrapped
-    # call's inner block is never double-counted as bare.
-    for match in QWEN38_BARE_CALL_RE.finditer(text):
-        calls.append(_qwen38_call_from_match(match.group(1), match.group(2), schema))
-    text = QWEN38_BARE_CALL_RE.sub("", text)
-    if not calls and tools and ("<tool_call>" in (reply or "") or "<function=" in (reply or "")):
-        sys.stderr.write("[api] qwen38 tool markers present but no call parsed -- "
-                         "possibly truncated or mangled output\n")
-        sys.stderr.flush()
+    accepted_spans = []
+    for _, _, match in found:
+        call = _qwen38_call_from_match(match.group(1), match.group(2), schema)
+        name = call["function"]["name"]
+        if tools and name not in schema:
+            sys.stderr.write(f"[api] qwen tool call to undeclared function {name!r} ignored\n")
+            sys.stderr.flush()
+            continue
+        calls.append(call)
+        accepted_spans.append((match.start(), match.end()))
+    text = original
+    for start, end in sorted(accepted_spans, reverse=True):
+        text = text[:start] + text[end:]
+    if not calls and tools:
+        unquoted = original
+        for qs, qe in sorted(quoted, reverse=True):
+            unquoted = unquoted[:qs] + unquoted[qe:]
+        if "<tool_call>" in unquoted or "<function=" in unquoted:
+            sys.stderr.write("[api] qwen38 tool markers present but no call parsed -- "
+                             "possibly truncated or mangled output\n")
+            sys.stderr.flush()
     return text.strip(), calls
 
 

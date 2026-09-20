@@ -31,6 +31,13 @@ typedef struct {
 
 static struct {
     int on, nl, ne, D, Ih, topk, ndev;
+    /* Strict GPU residency (COLI_STRICT_RESIDENCY=1): complete VRAM
+     * placement before readiness, no CPU fallback. The engine verifies
+     * full placement after warmstart and refuses (process-fatal) partial
+     * placement or any request that would compute a routed expert on CPU.
+     * Without this, a partial tier silently serves hybrid inference that
+     * VRAM readings alone misdiagnose as GPU-backed. */
+    int strict;
     int egs; size_t sc_gu, sc_d;   /* expert group size + per-matrix scale counts (gs64) */
     /* Formato dei pesi che il tier spedisce in VRAM: 4 = int4 raggruppato
      * (container gs64), 1 = int8 per-riga. Prima era cablato a 4 in ogni punto,
@@ -493,6 +500,10 @@ int qt_init(int nl, int ne, int D, int Ih, int cap, int topk, int expert_gs,
     }
     if(topk>QT_MAX_ROWS){ fprintf(stderr,"[qtier] topk>%d unsupported\n",QT_MAX_ROWS); return 0; }
     memset(&G,0,sizeof G);
+    {
+        const char *se = getenv("COLI_STRICT_RESIDENCY");
+        G.strict = (se && *se == '1');
+    }
     G.nl=nl; G.ne=ne; G.D=D; G.Ih=Ih; G.topk=topk;
     /* Placement state is re-derived per init: the device fold-in below reads
      * COLI_PLACE before the automatic placement has decided anything, and a
@@ -768,6 +779,32 @@ int qt_is_resident(int layer,int eid){
     pthread_mutex_unlock(&G.mx);
     return r;
 }
+
+/* Strict-residency accounting: how many experts are NOT VRAM-resident (0 =
+ * fully placed). Locks once for the whole scan; the engine calls it after
+ * warmstart and refuses to serve hybrid on any nonzero count. Testable
+ * without exiting so the fatal path stays thin. */
+int qt_verify_full_placement(void){
+    if(!G.on) return -1;
+    int missing = 0;
+    pthread_mutex_lock(&G.mx);
+    for(int l = 0; l < G.nl; l++)
+        for(int e = 0; e < G.ne; e++)
+            if(!qs(l,e)->resident) missing++;
+    pthread_mutex_unlock(&G.mx);
+    return missing;
+}
+
+/* Strict miss predicate: nonzero when any of the K routed experts missed
+ * the GPU (mask bit clear). The caller fails the request; the miss is
+ * never computed on CPU. */
+int qt_strict_miss(uint32_t qmask, int K){
+    if(!G.strict) return 0;
+    uint32_t want = (K >= 32) ? 0xFFFFFFFFu : (K <= 0 ? 0u : ((1u << K) - 1u));
+    return (qmask & want) != want;
+}
+
+int qt_strict_on(void){ return G.on && G.strict; }
 
 /* internal, G.mx held: enqueue one upload. victim=-1: plain upload (budget is
  * reserved here); victim>=0: LFRU swap (budget neutral). */

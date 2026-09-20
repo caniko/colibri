@@ -959,6 +959,15 @@ static int g_expert_gs = 0;   /* set from qwen36_meta.json (expert_gs) at load *
  * Same signal main's nbytes probe and tier_warmstart receive; the decode path
  * needs it to offer int8 experts (#1391): on an int8 container e->g4 is NULL. */
 static int g_expert_is_int4 = 1;
+/* Strict GPU residency (COLI_STRICT_RESIDENCY=1): complete VRAM placement
+ * before readiness, no CPU fallback for routed experts. The tier reports
+ * its own flag once on (qt_strict_on); this engine-side reader covers the
+ * paths where the tier is off or never started, where the tier flag alone
+ * cannot distinguish "not strict" from "strict but unavailable". */
+static int strict_residency(void){
+    const char *e = getenv("COLI_STRICT_RESIDENCY");
+    return e && *e == '1';
+}
 
 /* The single offer decision the decode path makes for a routed expert: offer
  * whichever format the container actually packed, exactly what tier_warmstart
@@ -2008,6 +2017,10 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
             }
             double _q0 = tm_now();
             uint32_t qmask = qt_issue(layer, idx, K, xs);
+            if (qt_strict_on() && qt_strict_miss(qmask, K)) {
+                fprintf(stderr, "[strict] REFUSING request: routed experts missed VRAM (no CPU fallback)\n");
+                exit(1);
+            }
             double _q1 = tm_now();
             for (int kk = 0; kk < K; kk++) {
                 if (qmask & (1u<<kk)) continue;
@@ -2046,6 +2059,13 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
                 g_qt_iss += _q1-_q0; g_qt_cpu += _q2-_q1; g_qt_tak += tm_now()-_q2;
             }
         } else {
+            /* Unreachable in strict mode (the tier is on or startup already
+             * refused), kept as a backstop so a future path cannot silently
+             * route compute to the CPU under a strict contract. */
+            if (qt_strict_on()) {
+                fprintf(stderr, "[strict] REFUSING: CPU MoE path reached with strict residency\n");
+                exit(1);
+            }
             for (int kk = 0; kk < K; kk++) {
                 Slot *e; expert_get(m, layer, idx[kk], &e);
                 slot_ensure_int8(m, e);
@@ -2800,7 +2820,16 @@ static void tier_warmstart(Model *m, int expert_is_int4) {
     uint8_t *planned = calloc((size_t)cap_total, 1);
     for (int i = 0; i < wn; i++) planned[wpl[i]*m->c.n_experts + wpe[i]] = 1;
     int keep8 = getenv("COLI_KEEP_INT8") != NULL;
-    #pragma omp parallel for schedule(dynamic, 16)
+    /* Strict mode frees the int8 decode cache for every slot, not just the
+     * planned ones: verification below guarantees all of them resident, so
+     * no CPU fallback can need them, and the miss refusal keeps it that
+     * way. Same ownership rule as the planned-only release (never free
+     * what the tier aliases: int8 containers keep e->g, whose wg == e->g).
+     * freed8 accounts the host bytes returned, reported with placement. */
+    int strict_all = strict_residency();
+    int64_t freed8 = 0;
+    int64_t slot8 = (int64_t)m->c.inter * m->c.hidden * 2 + (int64_t)m->c.hidden * m->c.inter;
+    #pragma omp parallel for schedule(dynamic, 16) reduction(+:freed8)
     for (int gi = 0; gi < cap_total; gi++) {
         int l = gi / m->c.n_experts, eidw = gi % m->c.n_experts;
         Slot *e; expert_get(m, l, eidw, &e);
@@ -2834,11 +2863,26 @@ static void tier_warmstart(Model *m, int expert_is_int4) {
              * copy is spare; int8 handed e->g itself, so it stays. A future
              * format that also aliases e->g is then correct without anyone
              * remembering to extend a format check here. */
-            if (!keep8 && e->g && wg != (const uint8_t *)e->g) { free(e->g); e->g = e->u = e->d = NULL; }
+            if (!keep8 && e->g && wg != (const uint8_t *)e->g && (planned[gi] || strict_all)) { free(e->g); e->g = e->u = e->d = NULL; freed8 += slot8; }
         }
     }
     qt_fill_wait();
     free(wpl); free(wpe); free(planned);
+    if (strict_all) {
+        /* Strict residency gate: every expert must be VRAM-resident before
+         * the first token. Anything short means the budget cannot hold the
+         * model and serving would silently fall back to CPU -- refuse
+         * instead. freed8 is the host int8 decode cache returned above;
+         * the packed weights stay mapped as the tier's upload source. */
+        int missing = qt_verify_full_placement();
+        if (missing != 0) {
+            fprintf(stderr, "[strict] REFUSING hybrid serve: %d/%d experts non-resident after warmstart (budget too small for full placement)\n",
+                    missing, cap_total);
+            exit(1);
+        }
+        fprintf(stderr, "[strict] residency: %d/%d experts VRAM-resident, %.2f GB host int8 released, no CPU fallback\n",
+                cap_total, cap_total, (double)freed8 / 1073741824.0);
+    }
     /* The parenthesis used to read "int8 only for non-residents", which was
      * true only while the int8 copy of every resident was freed. Since #1341
      * that free is int4-only: on an int8 container every resident keeps its
@@ -3057,7 +3101,15 @@ int main(int argc, char **argv) {
          * when HEAT_FILE exists, natural order otherwise), loading all RAM
          * slots along the way. */
         const char *nws = getenv("QT_NO_WARMSTART");
-        if (!(nws && *nws=='1')) tier_warmstart(&m, expert_is_int4);
+        if (nws && *nws == '1') {
+            if (strict_residency()) {
+                fprintf(stderr, "[strict] REFUSING: QT_NO_WARMSTART skips placement; strict residency needs the warmstart\n");
+                exit(1);
+            }
+        } else tier_warmstart(&m, expert_is_int4);
+    } else if (strict_residency()) {
+        fprintf(stderr, "[strict] REFUSING hybrid serve: GPU tier unavailable (qt_init declined)\n");
+        exit(1);
     }
 
     /* coli serve mode: speak the gateway wire protocol instead of argv
